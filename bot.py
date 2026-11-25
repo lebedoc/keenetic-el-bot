@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
@@ -10,6 +10,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Наприклад: https://el-golovatogo-bot.onrender.com
 PORT = int(os.getenv("PORT", "10000"))
 STATE_FILE = "state.json"
+KYIV_TZ = timezone(timedelta(hours=2))
 
 UA_MONTHS = {
     "січня": 1,
@@ -40,21 +41,24 @@ def save_state(state: dict) -> None:
 
 
 def format_duration(seconds: float) -> str:
-    total_minutes = max(0, int(seconds // 60))
-    hours, minutes = divmod(total_minutes, 60)
+    total_seconds = max(0, int(seconds))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
     if hours > 0:
         return f"{hours} год {minutes:02d} хв"
-    return f"{minutes} хв"
+    if minutes > 0:
+        return f"{minutes} хв {secs:02d} сек"
+    return f"{secs} сек"
 
 
 def parse_keenetic_message(text: str, fallback_dt: datetime):
-    client_match = re.search(r"Network client\s+'([^']+)'", text)
-    status_match = re.search(r"\b(connected|disconnected)\b", text, re.IGNORECASE)
-    time_match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
-    date_match = re.search(
-        r"\b(\d{1,2})\s+(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\b",
+    # Шукаємо клієнта в одинарних або подвійних лапках після 'Network client'
+    client_match = re.search(r"Network client\s+['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
+    # Шукаємо статус 'connected' або 'disconnected' після закритої лапки клієнта
+    status_match = re.search(
+        r"Network client\s+['\"][^'\"]+['\"].*?\b(connected|disconnected)\b",
         text,
-        re.IGNORECASE,
+        re.IGNORECASE | re.DOTALL,
     )
 
     if not client_match or not status_match:
@@ -62,6 +66,13 @@ def parse_keenetic_message(text: str, fallback_dt: datetime):
 
     client = client_match.group(1).strip()
     status = status_match.group(1).lower()
+
+    time_match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?\b", text)
+    date_match = re.search(
+        r"\b(\d{1,2})\s+(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\b",
+        text,
+        re.IGNORECASE,
+    )
 
     event_dt = fallback_dt
     if date_match:
@@ -78,8 +89,10 @@ def parse_keenetic_message(text: str, fallback_dt: datetime):
             pass
 
     if time_match:
-        hh, mm = int(time_match.group(1)), int(time_match.group(2))
-        candidate = event_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        hh = int(time_match.group(1))
+        mm = int(time_match.group(2))
+        ss = int(time_match.group(3)) if time_match.group(3) else 0
+        candidate = event_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
         if not date_match and candidate > fallback_dt:
             candidate -= timedelta(days=1)
         event_dt = candidate
@@ -92,8 +105,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
-    msg_time = msg.date.astimezone() if msg.date else datetime.now().astimezone()
-    parsed = parse_keenetic_message(msg.text, msg_time.replace(tzinfo=None))
+    # Якщо повідомлення переслане, беремо реальний час відправлення оригіналу
+    source_dt = msg.forward_origin.date if getattr(msg, "forward_origin", None) and getattr(msg.forward_origin, "date", None) else msg.date
+    if source_dt:
+        local_dt = source_dt.astimezone(KYIV_TZ).replace(tzinfo=None)
+    else:
+        local_dt = datetime.now(KYIV_TZ).replace(tzinfo=None)
+
+    parsed = parse_keenetic_message(msg.text, local_dt)
 
     if not parsed:
         await msg.reply_text("Не вдалося розпізнати формат повідомлення Keenetic.")
@@ -129,7 +148,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = (
         f"📌 *{client}*\n"
         f"{status_label}\n"
-        f"🕒 Час: `{event_dt.strftime('%d.%m %H:%M')}`"
+        f"🕒 Час: `{event_dt.strftime('%d.%m %H:%M:%S')}`"
         f"{duration_line}"
     )
     await msg.reply_text(reply, parse_mode="Markdown")
