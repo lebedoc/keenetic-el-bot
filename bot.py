@@ -4,7 +4,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Наприклад: https://el-golovatogo-bot.onrender.com
@@ -51,10 +51,18 @@ def format_duration(seconds: float) -> str:
     return f"{secs} сек"
 
 
+def format_dt(iso_str: str | None) -> str:
+    if not iso_str:
+        return "немає даних"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%d.%m %H:%M:%S")
+    except ValueError:
+        return iso_str
+
+
 def parse_keenetic_message(text: str, fallback_dt: datetime):
-    # Шукаємо клієнта в одинарних або подвійних лапках після 'Network client'
     client_match = re.search(r"Network client\s+['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
-    # Шукаємо статус 'connected' або 'disconnected' після закритої лапки клієнта
     status_match = re.search(
         r"Network client\s+['\"][^'\"]+['\"].*?\b(connected|disconnected)\b",
         text,
@@ -100,13 +108,61 @@ def parse_keenetic_message(text: str, fallback_dt: datetime):
     return client, status, event_dt
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
+    state = load_state()
+    if not state:
+        await msg.reply_text("Поки що немає збережених даних про клієнтів.")
+        return
+
+    now_local = datetime.now(KYIV_TZ).replace(tzinfo=None)
+    blocks = ["📊 *Поточний стан клієнтів:*"]
+
+    for client, info in state.items():
+        current_status = info.get("last_status", "unknown")
+        last_change = info.get("last_change")
+        outage_count = int(info.get("outage_count", 0))
+        total_disc_sec = float(info.get("total_disconnected_seconds", 0.0))
+
+        if current_status == "connected":
+            badge = "🟢 Підключено (`connected`)"
+        elif current_status == "disconnected":
+            badge = "🔴 Відключено (`disconnected`)"
+        else:
+            badge = f"⚪ Невідомо (`{current_status}`)"
+
+        lines = [
+            f"\n📌 *{client}*",
+            f"Статус: {badge}",
+            f"🕒 Остання зміна: `{format_dt(last_change)}`",
+            f"🔢 Відключень зафіксовано: *{outage_count}*",
+            f"⏳ Накопичено без зв'язку: *{format_duration(total_disc_sec)}*",
+        ]
+
+        if current_status == "disconnected" and info.get("last_disconnected"):
+            disc_dt = datetime.fromisoformat(info["last_disconnected"])
+            active_outage = (now_local - disc_dt).total_seconds()
+            if active_outage >= 0:
+                lines.append(f"⏱ Триває зараз: *{format_duration(active_outage)}*")
+
+        blocks.append("\n".join(lines))
+
+    await msg.reply_text("\n".join(blocks), parse_mode="Markdown")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text:
         return
 
-    # Якщо повідомлення переслане, беремо реальний час відправлення оригіналу
-    source_dt = msg.forward_origin.date if getattr(msg, "forward_origin", None) and getattr(msg.forward_origin, "date", None) else msg.date
+    source_dt = (
+        msg.forward_origin.date
+        if getattr(msg, "forward_origin", None) and getattr(msg.forward_origin, "date", None)
+        else msg.date
+    )
     if source_dt:
         local_dt = source_dt.astimezone(KYIV_TZ).replace(tzinfo=None)
     else:
@@ -122,6 +178,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     client_state = state.get(client, {})
 
+    outage_count = int(client_state.get("outage_count", 0))
+    total_disc_sec = float(client_state.get("total_disconnected_seconds", 0.0))
+
     duration_line = ""
     if status == "connected":
         last_disc = client_state.get("last_disconnected")
@@ -130,6 +189,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             diff = (event_dt - prev_dt).total_seconds()
             if diff >= 0:
                 duration_line = f"\n⏱ Не було: *{format_duration(diff)}*"
+                if client_state.get("last_status") == "disconnected":
+                    outage_count += 1
+                    total_disc_sec += diff
         client_state["last_connected"] = event_dt.isoformat()
         status_label = "🟢 Підключено (`connected`)"
     else:
@@ -141,6 +203,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 duration_line = f"\n⏱ Було підключено: *{format_duration(diff)}*"
         client_state["last_disconnected"] = event_dt.isoformat()
         status_label = "🔴 Відключено (`disconnected`)"
+
+    client_state["last_status"] = status
+    client_state["last_change"] = event_dt.isoformat()
+    client_state["outage_count"] = outage_count
+    client_state["total_disconnected_seconds"] = total_disc_sec
 
     state[client] = client_state
     save_state(state)
@@ -164,6 +231,7 @@ def main():
     asyncio.set_event_loop(loop)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     webhook_path = f"/{BOT_TOKEN}"
