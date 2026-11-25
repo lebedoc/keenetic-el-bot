@@ -6,6 +6,8 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Наприклад: https://el-golovatogo-bot.onrender.com
+PORT = int(os.getenv("PORT", "10000"))
 STATE_FILE = "state.json"
 
 UA_MONTHS = {
@@ -65,7 +67,6 @@ def parse_keenetic_message(text: str, fallback_dt: datetime):
         day = int(date_match.group(1))
         month = UA_MONTHS[date_match.group(2).lower()]
         year = fallback_dt.year
-        # Якщо в грудні прийшло повідомлення за січень — це наступний рік
         if fallback_dt.month == 12 and month == 1:
             year += 1
         elif fallback_dt.month == 1 and month == 12:
@@ -136,10 +137,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано змінну оточення BOT_TOKEN")
+    if not WEBHOOK_URL:
+        raise RuntimeError("Не задано змінну оточення WEBHOOK_URL")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("Бот @el_Golovatogo_bot запущено...")
-    app.run_polling()
+
+    webhook_path = f"/{BOT_TOKEN}"
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=webhook_path.lstrip("/"),
+        webhook_url=f"{WEBHOOK_URL.rstrip('/')}{webhook_path}",
+    )
 
 
 if __name__ == "__main__":
