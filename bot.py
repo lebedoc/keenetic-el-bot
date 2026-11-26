@@ -3,12 +3,11 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from aiohttp import web
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://el-golovatogo-bot.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Наприклад: https://el-golovatogo-bot.onrender.com
 PORT = int(os.getenv("PORT", "10000"))
 STATE_FILE = "state.json"
 KYIV_TZ = timezone(timedelta(hours=2))
@@ -237,46 +236,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply, parse_mode="Markdown")
 
 
-async def run_bot():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано змінну оточення BOT_TOKEN")
     if not WEBHOOK_URL:
         raise RuntimeError("Не задано змінну оточення WEBHOOK_URL")
 
-    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("status", status_command))
-    tg_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     webhook_path = f"/{BOT_TOKEN}"
-    full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}{webhook_path}"
-
-    await tg_app.initialize()
-    await tg_app.start()
-    await tg_app.bot.set_webhook(url=full_webhook_url)
-
-    async def handle_health(request):
-        return web.Response(text="OK")
-
-    async def handle_webhook(request):
-        data = await request.json()
-        update = Update.de_json(data, tg_app.bot)
-        await tg_app.process_update(update)
-        return web.Response(text="OK")
-
-    web_app = web.Application()
-    web_app.router.add_get("/", handle_health)
-    web_app.router.add_post(webhook_path, handle_webhook)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    await asyncio.Event().wait()
-
-
-def main():
-    asyncio.run(run_bot())
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=webhook_path.lstrip("/"),
+        webhook_url=f"{WEBHOOK_URL.rstrip('/')}{webhook_path}",
+    )
 
 
 if __name__ == "__main__":
