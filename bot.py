@@ -256,7 +256,5 @@ def main():
         url_path=webhook_path.lstrip("/"),
         webhook_url=f"{WEBHOOK_URL.rstrip('/')}{webhook_path}",
     )
-
-
 if __name__ == "__main__":
     main()
