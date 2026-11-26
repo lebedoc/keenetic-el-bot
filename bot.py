@@ -3,11 +3,12 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from aiohttp import web
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Наприклад: https://el-golovatogo-bot.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://el-golovatogo-bot.onrender.com
 PORT = int(os.getenv("PORT", "10000"))
 STATE_FILE = "state.json"
 KYIV_TZ = timezone(timedelta(hours=2))
@@ -62,18 +63,33 @@ def format_dt(iso_str: str | None) -> str:
 
 
 def parse_keenetic_message(text: str, fallback_dt: datetime):
-    client_match = re.search(r"Network client\s+['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
-    status_match = re.search(
-        r"Network client\s+['\"][^'\"]+['\"].*?\b(connected|disconnected)\b",
+    client = None
+    status = None
+
+    # 1. Український формат Keenetic: «Електроенергія Бойлер» підключено / відключено
+    ua_match = re.search(
+        r"[«\"']([^»\"']+)[»\"'].*?\b(підключено|відключено)\b",
         text,
         re.IGNORECASE | re.DOTALL,
     )
+    if ua_match:
+        client = ua_match.group(1).strip()
+        raw_status = ua_match.group(2).lower()
+        status = "connected" if raw_status == "підключено" else "disconnected"
 
-    if not client_match or not status_match:
+    # 2. Англійський формат Keenetic: Network client 'Електроенергія Бойлер' connected / disconnected
+    if not client or not status:
+        en_match = re.search(
+            r"Network client\s+['\"]([^'\"]+)['\"].*?\b(connected|disconnected)\b",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if en_match:
+            client = en_match.group(1).strip()
+            status = en_match.group(2).lower()
+
+    if not client or not status:
         return None
-
-    client = client_match.group(1).strip()
-    status = status_match.group(1).lower()
 
     time_match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?\b", text)
     date_match = re.search(
@@ -128,9 +144,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_disc_sec = float(info.get("total_disconnected_seconds", 0.0))
 
         if current_status == "connected":
-            badge = "🟢 Підключено (`connected`)"
+            badge = "🟢 Підключено"
         elif current_status == "disconnected":
-            badge = "🔴 Відключено (`disconnected`)"
+            badge = "🔴 Відключено"
         else:
             badge = f"⚪ Невідомо (`{current_status}`)"
 
@@ -193,7 +209,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     outage_count += 1
                     total_disc_sec += diff
         client_state["last_connected"] = event_dt.isoformat()
-        status_label = "🟢 Підключено (`connected`)"
+        status_label = "🟢 Підключено"
     else:
         last_conn = client_state.get("last_connected")
         if last_conn:
@@ -202,7 +218,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if diff >= 0:
                 duration_line = f"\n⏱ Було підключено: *{format_duration(diff)}*"
         client_state["last_disconnected"] = event_dt.isoformat()
-        status_label = "🔴 Відключено (`disconnected`)"
+        status_label = "🔴 Відключено"
 
     client_state["last_status"] = status
     client_state["last_change"] = event_dt.isoformat()
@@ -221,26 +237,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply, parse_mode="Markdown")
 
 
-def main():
+async def run_bot():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано змінну оточення BOT_TOKEN")
     if not WEBHOOK_URL:
         raise RuntimeError("Не задано змінну оточення WEBHOOK_URL")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("status", status_command))
+    tg_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     webhook_path = f"/{BOT_TOKEN}"
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=webhook_path.lstrip("/"),
-        webhook_url=f"{WEBHOOK_URL.rstrip('/')}{webhook_path}",
-    )
+    full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}{webhook_path}"
+
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.bot.set_webhook(url=full_webhook_url)
+
+    async def handle_health(request):
+        return web.Response(text="OK")
+
+    async def handle_webhook(request):
+        data = await request.json()
+        update = Update.de_json(data, tg_app.bot)
+        await tg_app.process_update(update)
+        return web.Response(text="OK")
+
+    web_app = web.Application()
+    web_app.router.add_get("/", handle_health)
+    web_app.router.add_post(webhook_path, handle_webhook)
+
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    await asyncio.Event().wait()
+
+
+def main():
+    asyncio.run(run_bot())
 
 
 if __name__ == "__main__":
