@@ -236,6 +236,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply, parse_mode="Markdown")
 
 
+async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=5)
+        if request_line:
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=5)
+                if not line or line == b"\r\n":
+                    break
+            body = b"OK"
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+                + body
+            )
+            writer.write(response)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def _start_health_server():
+    health_port = PORT + 1
+    server = await asyncio.start_server(_handle_client, "0.0.0.0", health_port)
+    async with server:
+        await server.serve_forever()
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано змінну оточення BOT_TOKEN")
@@ -256,5 +291,7 @@ def main():
         url_path=webhook_path.lstrip("/"),
         webhook_url=f"{WEBHOOK_URL.rstrip('/')}{webhook_path}",
     )
+
+
 if __name__ == "__main__":
     main()
