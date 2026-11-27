@@ -3,7 +3,7 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from telegram import Update
+from telegram import Bot, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -11,6 +11,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Наприклад: https://el-golovat
 PORT = int(os.getenv("PORT", "10000"))
 STATE_FILE = "state.json"
 KYIV_TZ = timezone(timedelta(hours=2))
+STATE_HEADER = "⚙️ STATE_DB (не видаляти):"
 
 UA_MONTHS = {
     "січня": 1,
@@ -28,16 +29,67 @@ UA_MONTHS = {
 }
 
 
-def load_state() -> dict:
+def load_local_state() -> dict:
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
 
-def save_state(state: dict) -> None:
+def save_local_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+async def load_persistent_state(bot: Bot, chat_id: int) -> dict:
+    # 1. Спочатку пробуємо локальний кеш у пам'яті контейнера
+    local = load_local_state()
+    if local:
+        return local
+
+    # 2. Якщо контейнер перезапустився на Render — читаємо із закріпленого повідомлення
+    try:
+        chat = await bot.get_chat(chat_id)
+        pinned = getattr(chat, "pinned_message", None)
+        if pinned and pinned.text and pinned.text.startswith(STATE_HEADER):
+            raw_json = pinned.text[len(STATE_HEADER):].strip()
+            data = json.loads(raw_json)
+            if isinstance(data, dict):
+                save_local_state(data)
+                return data
+    except Exception as e:
+        print(f"Не вдалося прочитати стан із закріпленого повідомлення: {e}")
+
+    return {}
+
+
+async def save_persistent_state(bot: Bot, chat_id: int, state: dict) -> None:
+    save_local_state(state)
+    payload = f"{STATE_HEADER}\n{json.dumps(state, ensure_ascii=False)}"
+
+    try:
+        chat = await bot.get_chat(chat_id)
+        pinned = getattr(chat, "pinned_message", None)
+        if pinned and pinned.text and pinned.text.startswith(STATE_HEADER):
+            if pinned.text != payload:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=pinned.message_id,
+                    text=payload,
+                )
+            return
+
+        sent = await bot.send_message(chat_id=chat_id, text=payload)
+        await bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print(f"Не вдалося зберегти стан у закріплене повідомлення: {e}")
 
 
 def format_duration(seconds: float) -> str:
@@ -128,7 +180,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    state = load_state()
+    state = await load_persistent_state(context.bot, msg.chat_id)
     if not state:
         await msg.reply_text("Поки що немає збережених даних про клієнтів.")
         return
@@ -190,7 +242,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     client, status, event_dt = parsed
-    state = load_state()
+    state = await load_persistent_state(context.bot, msg.chat_id)
     client_state = state.get(client, {})
 
     outage_count = int(client_state.get("outage_count", 0))
@@ -225,7 +277,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client_state["total_disconnected_seconds"] = total_disc_sec
 
     state[client] = client_state
-    save_state(state)
+    await save_persistent_state(context.bot, msg.chat_id, state)
 
     reply = (
         f"📌 *{client}*\n"
@@ -234,41 +286,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{duration_line}"
     )
     await msg.reply_text(reply, parse_mode="Markdown")
-
-
-async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    try:
-        request_line = await asyncio.wait_for(reader.readline(), timeout=5)
-        if request_line:
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=5)
-                if not line or line == b"\r\n":
-                    break
-            body = b"OK"
-            response = (
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/plain; charset=utf-8\r\n"
-                + f"Content-Length: {len(body)}\r\n".encode("ascii")
-                + b"Connection: close\r\n\r\n"
-                + body
-            )
-            writer.write(response)
-            await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-
-
-async def _start_health_server():
-    health_port = PORT + 1
-    server = await asyncio.start_server(_handle_client, "0.0.0.0", health_port)
-    async with server:
-        await server.serve_forever()
 
 
 def main():
