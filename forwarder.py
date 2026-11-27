@@ -80,9 +80,9 @@ async def _start_telethon_forwarder():
         text = event.raw_text or ""
         if not is_client_event(text):
             return
-        await client.forward_messages(target_entity, event.message)
+        await client.send_message(target_entity, text)
         first_line = text.splitlines()[0] if text.splitlines() else ""
-        print(f"Переслано: {first_line}")
+        print(f"Надіслано: {first_line}")
 
     await client.run_until_disconnected()
 
